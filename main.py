@@ -1,7 +1,7 @@
 import os
 import random
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -12,7 +12,12 @@ from PIL import Image
 from scipy.ndimage import gaussian_filter, map_coordinates
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from segment_anything import SamPredictor, sam_model_registry
+try:
+    from segment_anything import SamPredictor, sam_model_registry
+except ImportError as exc:  # pragma: no cover - ensures actionable error
+    raise SystemExit(
+        "segment-anything must be installed. Clone the repo and run `pip install -e .`."
+    ) from exc
 
 
 @dataclass
@@ -21,11 +26,14 @@ class ExperimentConfig:
     sequence: str = "01"
     batch_size: int = 1
     epochs: int = 5
-    lr: float = 1e-3
+    lr: float = 1e-5
+    weight_decay: float = 0.0
     val_fraction: float = 0.2
     seed: int = 7
     sam_model_type: str = "vit_b"
     sam_checkpoint_path: str = os.path.join("weights", "sam_vit_b_01ec64.pth")
+    freeze_image_encoder: bool = True
+    freeze_prompt_encoder: bool = True
 
     @property
     def images_dir(self) -> str:
@@ -48,7 +56,6 @@ class RandomRotationPair:
         mask_rot = TF.rotate(mask, angle, interpolation=TF.InterpolationMode.NEAREST)
         mask_rot = mask_rot.squeeze(0)
         mask_rot = (mask_rot > 0.5).float()
-
         return img_rot, mask_rot
 
 
@@ -78,7 +85,6 @@ class ElasticDeformationPair:
 
         img_deformed = torch.from_numpy(img_deformed).unsqueeze(0).float()
         mask_deformed = torch.from_numpy(mask_deformed).unsqueeze(0).float()
-
         return img_deformed, mask_deformed
 
 
@@ -121,128 +127,12 @@ class CellSegDataSet(Dataset):
         if self.transform:
             img_aug, mask_aug = self.transform(img_tensor.clone(), mask.clone())
             sample["img_aug"] = img_aug
-            sample["mask_aug"] = mask_aug.unsqueeze(0) if mask_aug.dim() == 2 else mask_aug
+            sample["mask_aug"] = mask_aug if mask_aug.dim() == 3 else mask_aug.unsqueeze(0)
 
         return sample
 
     def __len__(self) -> int:
         return len(self.imgs)
-
-
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
-
-class SimpleUNet(nn.Module):
-    def __init__(self, in_channels: int = 1, out_channels: int = 1, base_channels: int = 32):
-        super().__init__()
-        self.down1 = DoubleConv(in_channels, base_channels)
-        self.down2 = DoubleConv(base_channels, base_channels * 2)
-        self.down3 = DoubleConv(base_channels * 2, base_channels * 4)
-
-        self.pool = nn.MaxPool2d(2)
-        self.bottleneck = DoubleConv(base_channels * 4, base_channels * 8)
-
-        self.up3 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4, kernel_size=2, stride=2)
-        self.conv3 = DoubleConv(base_channels * 8, base_channels * 4)
-
-        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, kernel_size=2, stride=2)
-        self.conv2 = DoubleConv(base_channels * 4, base_channels * 2)
-
-        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=2, stride=2)
-        self.conv1 = DoubleConv(base_channels * 2, base_channels)
-
-        self.out_conv = nn.Conv2d(base_channels, out_channels, kernel_size=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        d1 = self.down1(x)
-        d2 = self.down2(self.pool(d1))
-        d3 = self.down3(self.pool(d2))
-
-        bottleneck = self.bottleneck(self.pool(d3))
-
-        u3 = torch.cat([self.up3(bottleneck), d3], dim=1)
-        u3 = self.conv3(u3)
-
-        u2 = torch.cat([self.up2(u3), d2], dim=1)
-        u2 = self.conv2(u2)
-
-        u1 = torch.cat([self.up1(u2), d1], dim=1)
-        u1 = self.conv1(u1)
-
-        return self.out_conv(u1)
-
-
-def stack_original_and_augmented(batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-    imgs = [batch["img"]]
-    masks = [batch["mask"]]
-
-    if "img_aug" in batch and "mask_aug" in batch:
-        imgs.append(batch["img_aug"])
-        masks.append(batch["mask_aug"])
-
-    img_tensor = torch.cat(imgs, dim=0)
-    mask_tensor = torch.cat(masks, dim=0)
-    return img_tensor, mask_tensor
-
-
-def dice_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> float:
-    preds = torch.sigmoid(logits)
-    preds = (preds > 0.5).float()
-    intersection = (preds * targets).sum(dim=(1, 2, 3))
-    total = preds.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3))
-    dice = (2 * intersection + 1e-6) / (total + 1e-6)
-    return dice.mean().item()
-
-
-def train_one_epoch(model, loader, optimizer, criterion, device) -> float:
-    model.train()
-    running_loss = 0.0
-
-    for batch in loader:
-        imgs, masks = stack_original_and_augmented(batch)
-        imgs, masks = imgs.to(device), masks.to(device)
-
-        optimizer.zero_grad()
-        logits = model(imgs)
-        loss = criterion(logits, masks)
-        loss.backward()
-        optimizer.step()
-
-        running_loss += loss.item()
-
-    return running_loss / len(loader)
-
-
-def evaluate(model, loader, criterion, device) -> Tuple[float, float]:
-    model.eval()
-    running_loss = 0.0
-    running_dice = 0.0
-
-    with torch.no_grad():
-        for batch in loader:
-            imgs = batch["img"].to(device)
-            masks = batch["mask"].to(device)
-            logits = model(imgs)
-            loss = criterion(logits, masks)
-
-            running_loss += loss.item()
-            running_dice += dice_from_logits(logits, masks)
-
-    n = len(loader)
-    return running_loss / n, running_dice / n
 
 
 def set_seed(seed: int):
@@ -267,19 +157,8 @@ def prepare_dataloaders(cfg: ExperimentConfig) -> Tuple[DataLoader, DataLoader]:
     train_dataset = Subset(CellSegDataSet(cfg.images_dir, cfg.masks_dir, transform=FullAugmentation()), train_indices)
     val_dataset = Subset(CellSegDataSet(cfg.images_dir, cfg.masks_dir, transform=None), val_indices)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=0,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=0,
-    )
-
+    train_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
     return train_loader, val_loader
 
 
@@ -301,6 +180,27 @@ def ensure_sam_checkpoint(path: str, model_type: str) -> str:
     return path
 
 
+def build_sam_model(cfg: ExperimentConfig, device: torch.device):
+    checkpoint_path = ensure_sam_checkpoint(cfg.sam_checkpoint_path, cfg.sam_model_type)
+    model = sam_model_registry[cfg.sam_model_type](checkpoint=checkpoint_path)
+    model.to(device)
+    return model
+
+
+def configure_trainable_modules(model, cfg: ExperimentConfig):
+    for param in model.image_encoder.parameters():
+        param.requires_grad = not cfg.freeze_image_encoder
+    for param in model.prompt_encoder.parameters():
+        param.requires_grad = not cfg.freeze_prompt_encoder
+    for param in model.mask_decoder.parameters():
+        param.requires_grad = True
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if not trainable:
+        raise RuntimeError("No trainable SAM parameters selected; adjust freezing options.")
+    return trainable
+
+
 def mask_to_box(mask: torch.Tensor) -> np.ndarray:
     binary = (mask.squeeze().cpu().numpy() > 0.5).astype(np.uint8)
     ys, xs = np.where(binary > 0)
@@ -311,12 +211,152 @@ def mask_to_box(mask: torch.Tensor) -> np.ndarray:
     return np.array([x0, y0, x1, y1], dtype=np.float32)
 
 
-def run_sam_with_box(image: torch.Tensor, box: np.ndarray, cfg: ExperimentConfig, device: torch.device) -> np.ndarray:
-    checkpoint_path = ensure_sam_checkpoint(cfg.sam_checkpoint_path, cfg.sam_model_type)
-    sam = sam_model_registry[cfg.sam_model_type](checkpoint=checkpoint_path)
-    sam.to(device)
-    predictor = SamPredictor(sam)
+def gather_views_from_batch(batch: Dict[str, torch.Tensor], include_augmented: bool) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    views: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    imgs = batch["img"]
+    masks = batch["mask"]
+    for idx in range(imgs.shape[0]):
+        views.append((imgs[idx], masks[idx]))
 
+    if include_augmented and "img_aug" in batch and "mask_aug" in batch:
+        aug_imgs = batch["img_aug"]
+        aug_masks = batch["mask_aug"]
+        for idx in range(aug_imgs.shape[0]):
+            views.append((aug_imgs[idx], aug_masks[idx]))
+    return views
+
+
+def prepare_image_for_sam(img: torch.Tensor) -> torch.Tensor:
+    if img.shape[0] == 1:
+        img = img.repeat(3, 1, 1)
+    elif img.shape[0] != 3:
+        raise ValueError(f"Unexpected number of channels ({img.shape[0]}).")
+    return (img * 255.0).float()
+
+
+def sam_predict_logits(model, image: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
+    model_input = model.preprocess(image.unsqueeze(0))
+    image_embeddings = model.image_encoder(model_input)
+    sparse_embeddings, dense_embeddings = model.prompt_encoder(points=None, boxes=boxes, masks=None)
+    dense_pe = model.prompt_encoder.get_dense_pe()
+    dense_pe = dense_pe.to(image_embeddings.device).type_as(image_embeddings)
+    low_res_masks, _ = model.mask_decoder(
+        image_embeddings=image_embeddings,
+        image_pe=dense_pe,
+        sparse_prompt_embeddings=sparse_embeddings,
+        dense_prompt_embeddings=dense_embeddings,
+        multimask_output=False,
+    )
+    upscaled_masks = model.postprocess_masks(
+        low_res_masks,
+        input_size=image.shape[-2:],
+        original_size=image.shape[-2:],
+    )
+    return upscaled_masks
+
+
+def dice_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> float:
+    preds = torch.sigmoid(logits)
+    intersection = (preds * targets).sum(dim=(1, 2, 3))
+    total = preds.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3))
+    dice = (2 * intersection + 1e-6) / (total + 1e-6)
+    return dice.mean().item()
+
+
+def forward_view(model, img: torch.Tensor, mask: torch.Tensor, device: torch.device) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    if mask.max() <= 0:
+        return None
+    rgb = prepare_image_for_sam(img).to(device)
+    try:
+        bbox = mask_to_box(mask)
+    except RuntimeError:
+        return None
+
+    box_tensor = torch.as_tensor(bbox, dtype=torch.float32, device=device).unsqueeze(0)
+    logits = sam_predict_logits(model, rgb, box_tensor)
+    target = mask.unsqueeze(0).to(device)
+    return logits, target
+
+
+def train_sam_one_epoch(model, loader, optimizer, criterion, device) -> Tuple[float, float]:
+    model.train()
+    epoch_loss = 0.0
+    epoch_dice = 0.0
+    steps = 0
+
+    for batch in loader:
+        views = gather_views_from_batch(batch, include_augmented=True)
+        optimizer.zero_grad()
+
+        view_losses = []
+        view_dices = []
+        for img, mask in views:
+            result = forward_view(model, img, mask, device)
+            if result is None:
+                continue
+            logits, target = result
+            loss = criterion(logits, target)
+            view_losses.append(loss)
+            view_dices.append(dice_from_logits(logits, target))
+
+        if not view_losses:
+            continue
+
+        batch_loss = torch.stack(view_losses).mean()
+        batch_loss.backward()
+        optimizer.step()
+
+        epoch_loss += batch_loss.item()
+        epoch_dice += float(sum(view_dices) / len(view_dices))
+        steps += 1
+
+    if steps == 0:
+        return 0.0, 0.0
+    return epoch_loss / steps, epoch_dice / steps
+
+
+@torch.no_grad()
+def evaluate_sam(model, loader, criterion, device) -> Tuple[float, float]:
+    model.eval()
+    total_loss = 0.0
+    total_dice = 0.0
+    samples = 0
+
+    for batch in loader:
+        views = gather_views_from_batch(batch, include_augmented=False)
+        for img, mask in views:
+            result = forward_view(model, img, mask, device)
+            if result is None:
+                continue
+            logits, target = result
+            loss = criterion(logits, target)
+            total_loss += loss.item()
+            total_dice += dice_from_logits(logits, target)
+            samples += 1
+
+    if samples == 0:
+        return 0.0, 0.0
+    return total_loss / samples, total_dice / samples
+
+
+def fine_tune_sam(model, train_loader, val_loader, cfg: ExperimentConfig, device: torch.device):
+    trainable_params = configure_trainable_modules(model, cfg)
+    optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    criterion = nn.BCEWithLogitsLoss()
+
+    for epoch in range(1, cfg.epochs + 1):
+        train_loss, train_dice = train_sam_one_epoch(model, train_loader, optimizer, criterion, device)
+        val_loss, val_dice = evaluate_sam(model, val_loader, criterion, device)
+        print(
+            f"[SAM fine-tune] Epoch {epoch:02d}/{cfg.epochs} "
+            f"- train loss: {train_loss:.4f} | train dice: {train_dice:.4f} "
+            f"- val loss: {val_loss:.4f} | val dice: {val_dice:.4f}"
+        )
+
+
+def run_sam_with_box(image: torch.Tensor, box: np.ndarray, sam_model, device: torch.device) -> np.ndarray:
+    predictor = SamPredictor(sam_model)
+    predictor.model.to(device)
     image_np = (image.squeeze().cpu().numpy() * 255).astype(np.uint8)
     image_rgb = np.stack([image_np] * 3, axis=-1)
     predictor.set_image(image_rgb)
@@ -333,29 +373,19 @@ def main():
     print(f"Using device: {device}")
     train_loader, val_loader = prepare_dataloaders(cfg)
 
-    model = SimpleUNet().to(device)
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-
-    for epoch in range(1, cfg.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss, val_dice = evaluate(model, val_loader, criterion, device)
-        print(
-            f"Epoch {epoch:02d}/{cfg.epochs} "
-            f"- train loss: {train_loss:.4f} "
-            f"- val loss: {val_loss:.4f} "
-            f"- val dice: {val_dice:.4f}"
-        )
+    sam_model = build_sam_model(cfg, device)
+    fine_tune_sam(sam_model, train_loader, val_loader, cfg, device)
 
     if len(val_loader.dataset) == 0:
-        print("Validation set is empty; skipping SAM test.")
+        print("Validation set is empty; skipping SAM inference.")
         return
 
+    sam_model.eval()
     sample_batch = next(iter(val_loader))
     sample_img = sample_batch["img"][0]
     sample_mask = sample_batch["mask"][0]
     bbox = mask_to_box(sample_mask)
-    sam_mask = run_sam_with_box(sample_img, bbox, cfg, device)
+    sam_mask = run_sam_with_box(sample_img, bbox, sam_model, device)
 
     gt_mask = sample_mask.squeeze().cpu().numpy()
     sam_binary = (sam_mask > 0).astype(np.float32)
